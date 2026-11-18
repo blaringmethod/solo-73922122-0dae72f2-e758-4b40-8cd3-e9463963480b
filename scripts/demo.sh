@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end demo against a running service (default http://localhost:8000).
-# Shows: upload -> progress polling -> download verification, plus cancellation
-# and a rejected (malformed) upload.
+# Shows: upload -> progress polling -> download verification, cancellation,
+# a rejected (malformed) upload, and finally releasing the succeeded task's
+# disk (release -> releasing -> released -> downloads return 409).
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8000}"
@@ -104,5 +105,22 @@ echo
 
 echo "== cancelling the already succeeded task -> HTTP 409 =="
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/tasks/$ID/cancel"
+
+echo "== release the succeeded task's disk (202, then releasing -> released) =="
+curl -fsS -X POST "$BASE_URL/tasks/$ID/release"
+echo
+while :; do
+  BODY=$(curl -fsS "$BASE_URL/tasks/$ID")
+  REL=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["release_status"])' <<<"$BODY")
+  echo "$BODY"
+  case "$REL" in
+    released) break ;;
+  esac
+  sleep 0.5
+done
+
+echo "== downloads after release -> HTTP 409 =="
+curl -s -o /dev/null -w '%{http_code}\n' "$BASE_URL/tasks/$ID/download/r1"
+curl -s -o /dev/null -w '%{http_code}\n' "$BASE_URL/tasks/$ID/download/r2"
 
 echo "ALL DEMO STEPS DONE"

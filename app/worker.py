@@ -28,6 +28,51 @@ _cancel_events: dict[str, threading.Event] = {}
 _registry_lock = threading.Lock()
 # Keep worker threads reachable (mostly for tests / diagnostics).
 _workers: dict[str, threading.Thread] = {}
+# task_id -> release reaper thread currently running for that task.
+_reapers: dict[str, threading.Thread] = {}
+
+
+class DownloadTracker:
+    """Counts in-flight result downloads per task.
+
+    The release protocol relies on two orderings:
+      * the download endpoint acquires a permit BEFORE it re-checks the
+        task's release status, and holds it until streaming ends;
+      * the release endpoint commits 'releasing' BEFORE the reaper looks at
+        the counter.
+    A download admitted before the release is therefore always visible to
+    the reaper, which waits for it; a download that arrives after the
+    release sees 'releasing' in the database and is rejected with 409.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._counts: dict[str, int] = {}
+
+    def acquire(self, task_id: str) -> None:
+        with self._cond:
+            self._counts[task_id] = self._counts.get(task_id, 0) + 1
+
+    def release(self, task_id: str) -> None:
+        with self._cond:
+            remaining = self._counts.get(task_id, 0) - 1
+            if remaining > 0:
+                self._counts[task_id] = remaining
+            else:
+                self._counts.pop(task_id, None)
+            self._cond.notify_all()
+
+    def active(self, task_id: str) -> int:
+        with self._cond:
+            return self._counts.get(task_id, 0)
+
+    def wait_until_idle(self, task_id: str) -> None:
+        with self._cond:
+            self._cond.wait_for(lambda: self._counts.get(task_id, 0) == 0)
+
+
+# In-flight downloads of published results, keyed by task id.
+DOWNLOADS = DownloadTracker()
 
 
 class UploadTooLarge(Exception):
@@ -203,10 +248,14 @@ def start_worker(task_id: str) -> None:
 def recover_on_startup() -> dict[str, int]:
     """Mark unfinished tasks failed and remove their staging files.
 
-    Succeeded tasks keep their result files and remain downloadable.
+    Succeeded tasks keep their result files and remain downloadable. Tasks
+    whose release was interrupted mid-cleanup (release_status='releasing')
+    are cleaned up again here: a fresh process has no in-flight downloads,
+    so the retry can run inline.
     """
     conn = db.connect()
     recovered = 0
+    releasing: list[str] = []
     try:
         ids = db.non_terminal_task_ids(conn)
         for task_id in ids:
@@ -223,7 +272,83 @@ def recover_on_startup() -> dict[str, int]:
             )
             cleanup_task_dir(task_id)
             recovered += 1
+        releasing = db.releasing_task_ids(conn)
     finally:
         conn.close()
     # Cancellation registry is empty in a fresh process.
-    return {"recovered": recovered}
+    resumed = 0
+    for task_id in releasing:
+        if attempt_release_cleanup(task_id):
+            resumed += 1
+    return {"recovered": recovered, "release_resumed": resumed}
+
+
+def attempt_release_cleanup(task_id: str) -> bool:
+    """Try to delete both published result files of a releasing task.
+
+    Returns True when the task is fully released afterwards (both ends
+    gone). Deleting either end may fail; in that case the task stays in
+    'releasing' with the error recorded, downloads remain blocked, and a
+    later release request or restart retries the cleanup. Only this task's
+    own directory is ever touched.
+    """
+    conn = db.connect()
+    try:
+        row = db.get_task(conn, task_id)
+        if row is None or row["release_status"] != db.RELEASE_RELEASING:
+            return row is not None and row["release_status"] == db.RELEASE_RELEASED
+        base = task_dir(task_id).resolve()
+        errors: list[str] = []
+        for rel in (row["result_r1"], row["result_r2"]):
+            if not rel:
+                continue
+            path = (base / rel).resolve()
+            # Never follow a stored path outside this task's own directory.
+            if base not in path.parents:
+                errors.append(f"{rel}: path escapes task directory")
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                errors.append(f"{rel}: {exc.strerror or exc}")
+        if errors:
+            db.update_task(conn, task_id, release_error="; ".join(errors))
+            return False
+        db.mark_released(conn, task_id)
+    finally:
+        conn.close()
+    # Both ends are gone; drop the remaining directory shell best-effort.
+    cleanup_task_dir(task_id)
+    return True
+
+
+def _reaper_main(task_id: str) -> None:
+    """Wait for in-flight downloads to drain, then clean up the results."""
+    try:
+        DOWNLOADS.wait_until_idle(task_id)
+        attempt_release_cleanup(task_id)
+    finally:
+        with _registry_lock:
+            _reapers.pop(task_id, None)
+
+
+def request_release_cleanup(task_id: str) -> None:
+    """Ensure a reaper thread is working on this task's release.
+
+    Idempotent: if a reaper is already waiting for downloads to drain (or
+    cleaning up), the call is a no-op; if a previous cleanup attempt failed
+    and its reaper exited, a new one is started — this is how repeated
+    release requests retry an unfinished cleanup.
+    """
+    with _registry_lock:
+        existing = _reapers.get(task_id)
+        if existing is not None and existing.is_alive():
+            return
+        thread = threading.Thread(
+            target=_reaper_main,
+            args=(task_id,),
+            name=f"fastq-release-{task_id[:8]}",
+            daemon=True,
+        )
+        _reapers[task_id] = thread
+        thread.start()

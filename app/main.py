@@ -1,4 +1,5 @@
-"""FastAPI application: bounded uploads, status, cancellation, downloads."""
+"""FastAPI application: bounded uploads, status, cancellation, downloads,
+and disk-release of succeeded results."""
 
 from __future__ import annotations
 
@@ -8,7 +9,8 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile, status
+
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -25,11 +27,14 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Paired FASTQ Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Upload shuffled paired-end FASTQ files (R1/R2, uncompressed, "
         "max 256 MiB each). The service re-pairs them by read id, delivers "
-        "both mates in R1 order and preserves the original bytes."
+        "both mates in R1 order and preserves the original bytes. Succeeded "
+        "results can be downloaded until POST /tasks/{id}/release reclaims "
+        "their disk space: acceptance blocks new downloads, in-flight "
+        "downloads finish first, and the task then reads as released."
     ),
     lifespan=lifespan,
 )
@@ -45,6 +50,8 @@ class TaskOut(BaseModel):
     r2_name: str
     r1_bytes: int
     r2_bytes: int
+    release_status: str
+    release_error: str
     created_at: str
     updated_at: str
     download_r1: str | None = None
@@ -53,7 +60,11 @@ class TaskOut(BaseModel):
 
 def _serialize(row: sqlite3.Row) -> TaskOut:
     download_r1 = download_r2 = None
-    if row["status"] == "succeeded" and row["result_r1"]:
+    if (
+        row["status"] == "succeeded"
+        and row["release_status"] == db.RELEASE_NONE
+        and row["result_r1"]
+    ):
         download_r1 = f"/tasks/{row['id']}/download/r1"
         download_r2 = f"/tasks/{row['id']}/download/r2"
     return TaskOut(
@@ -66,6 +77,8 @@ def _serialize(row: sqlite3.Row) -> TaskOut:
         r2_name=row["r2_name"],
         r1_bytes=row["r1_bytes"],
         r2_bytes=row["r2_bytes"],
+        release_status=row["release_status"],
+        release_error=row["release_error"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         download_r1=download_r1,
@@ -197,6 +210,16 @@ def _result_path(task_id: str, side: int) -> Path:
                 status_code=409,
                 detail=f"task is {row['status']}; results are not published",
             )
+        if row["release_status"] == db.RELEASE_RELEASING:
+            raise HTTPException(
+                status_code=409,
+                detail="release in progress; downloads are disabled",
+            )
+        if row["release_status"] == db.RELEASE_RELEASED:
+            raise HTTPException(
+                status_code=409,
+                detail="results have been released and are no longer downloadable",
+            )
         rel = row["result_r1"] if side == 1 else row["result_r2"]
         if not rel:
             raise HTTPException(status_code=404, detail="result file missing")
@@ -211,22 +234,102 @@ def _result_path(task_id: str, side: int) -> Path:
     return path
 
 
+class _TrackedFileResponse(FileResponse):
+    """FileResponse that holds a download permit until streaming ends.
+
+    The permit is acquired by the endpoint before the release status is
+    checked; it is released here, after the body has been fully sent or the
+    client has disconnected — whichever happens first. Only then may the
+    release reaper delete the underlying files.
+    """
+
+    def __init__(self, *args, task_id: str, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._task_id = task_id
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            worker.DOWNLOADS.release(self._task_id)
+
+
+def _download(task_id: str, side: int) -> FileResponse:
+    # Acquire the permit BEFORE checking the release status: a release that
+    # is committed after this point is guaranteed to see this download and
+    # wait for it; a release committed before is seen in _result_path and
+    # rejected with 409.
+    worker.DOWNLOADS.acquire(task_id)
+    try:
+        path = _result_path(task_id, side)
+        response = _TrackedFileResponse(
+            path,
+            task_id=task_id,
+            media_type="text/plain",
+            filename=f"R{side}.fastq",
+            headers={"Content-Length": str(path.stat().st_size)},
+        )
+    except BaseException:
+        worker.DOWNLOADS.release(task_id)
+        raise
+    return response
+
+
 @app.get("/tasks/{task_id}/download/r1")
 def download_r1(task_id: str) -> FileResponse:
-    path = _result_path(task_id, 1)
-    return FileResponse(
-        path, media_type="text/plain", filename="R1.fastq",
-        headers={"Content-Length": str(path.stat().st_size)},
-    )
+    return _download(task_id, 1)
 
 
 @app.get("/tasks/{task_id}/download/r2")
 def download_r2(task_id: str) -> FileResponse:
-    path = _result_path(task_id, 2)
-    return FileResponse(
-        path, media_type="text/plain", filename="R2.fastq",
-        headers={"Content-Length": str(path.stat().st_size)},
-    )
+    return _download(task_id, 2)
+
+
+@app.post(
+    "/tasks/{task_id}/release",
+    response_model=TaskOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        200: {
+            "model": TaskOut,
+            "description": "Results were already released; nothing left to do.",
+        },
+        404: {"description": "Task not found."},
+        409: {"description": "Task is not in a succeeded state."},
+    },
+)
+def release_task(task_id: str, response: Response) -> TaskOut:
+    """Reclaim the disk space of a succeeded task's paired results.
+
+    Once accepted (202), new R1/R2 downloads are rejected; downloads already
+    in progress finish (or disconnect) before both result files are deleted.
+    The task then reads as ``release_status='released'``. If deleting either
+    end fails, the task stays ``'releasing'`` (see ``release_error``) and a
+    repeated POST retries the cleanup; cleanup also resumes automatically
+    after a service restart.
+    """
+    conn = db.connect()
+    try:
+        row = db.get_task(conn, task_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        if row["status"] != "succeeded":
+            raise HTTPException(
+                status_code=409,
+                detail=f"task is {row['status']}; only succeeded tasks can be released",
+            )
+        outcome = db.try_start_release(conn, task_id)
+        row = db.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    if outcome == db.RELEASE_RELEASED:
+        # Already fully reclaimed; nothing left to do.
+        response.status_code = status.HTTP_200_OK
+        return _serialize(row)
+
+    worker.request_release_cleanup(task_id)
+    return _serialize(row)
 
 
 @app.get("/health")

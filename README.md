@@ -46,19 +46,40 @@
   `interrupted by service restart`）并清理暂存与记录；`succeeded` 任务的
   结果文件保留，仍可下载。
 
+## 释放磁盘（release）
+
+比对作业取走结果后，可主动回收任务占用的磁盘：
+
+- `POST /tasks/{id}/release`：仅 `succeeded` 任务可申请（其他状态 `409`，
+  未知任务 `404`）。受理返回 `202`，任务进入 `release_status='releasing'`。
+- **受理即禁止新下载**：R1/R2 下载接口立即返回 `409`；查询结果不再给出
+  下载链接。
+- **进行中的下载受保护**：已开始的下载完整发送（或客户端断开）之后，
+  后台清理线程才会删除双端结果文件；随后任务变为
+  `release_status='released'`，任务目录一并移除。
+- **查询可区分**：`GET /tasks/{id}` 的 `release_status` 为
+  `none`（未申请）/ `releasing`（回收中）/ `released`（已回收）。
+- **失败不谎报**：删除任一端失败时保持 `releasing`，`release_error`
+  记录失败原因，下载保持禁止；重复 `POST /release` 可重试未完成的清理，
+  服务重启后也会自动继续清理。两端文件都确认删除后才标记 `released`。
+- 已 `released` 的任务再申请释放返回 `200`（幂等）；未申请释放的成功
+  结果照常下载，配对与取消规则不变。清理只触碰本任务目录，不影响其他
+  任务的文件。
+
 ## API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/tasks` | multipart 字段 `r1`、`r2`，返回任务对象（202） |
-| GET  | `/tasks/{id}` | 状态/进度/消息/下载链接 |
+| GET  | `/tasks/{id}` | 状态/进度/消息/释放状态/下载链接 |
 | POST | `/tasks/{id}/cancel` | 请求取消（立即返回） |
-| GET  | `/tasks/{id}/download/r1` | 下载配对后的 R1 |
-| GET  | `/tasks/{id}/download/r2` | 下载配对后的 R2 |
+| POST | `/tasks/{id}/release` | 申请释放成功结果占用的磁盘（202 受理 / 200 已释放） |
+| GET  | `/tasks/{id}/download/r1` | 下载配对后的 R1（释放受理后返回 409） |
+| GET  | `/tasks/{id}/download/r2` | 下载配对后的 R2（释放受理后返回 409） |
 | GET  | `/health` | 健康检查 |
 
 启动后打开交互式文档：<http://localhost:8000/docs>，可直接在页面上演示
-上传、取消、下载全流程。
+上传、取消、释放、查询与下载全流程。
 
 ## 运行（Docker Compose，内存上限 256 MiB）
 
@@ -88,15 +109,18 @@ BASE_URL=http://localhost:8000 ./scripts/demo.sh
 ```
 
 脚本会生成一对乱序 FASTQ，演示上传 → 轮询进度 → 下载校验，并额外演示一次
-取消与一次错误输入。
+取消、一次错误输入，以及一次释放（release → releasing → released → 下载
+返回 409）。
 
 ## 自测
 
 ```bash
-# 短测试（功能/取消/重启语义 + 取消与完成的仲裁），共 39 项检查
+# 短测试（功能/取消/重启语义 + 释放生命周期 + 取消与完成的仲裁），共 81 项检查
 bash scripts/run_tests.sh
 # 或分别运行
 .venv/bin/python -I tests/test_api.py          # 30 项：配对、整次失败、取消、重启恢复
+.venv/bin/python -I tests/test_release.py      # 42 项：释放受理、下载门禁、在途下载保护、
+                                               #       断连清理、删除失败重试、重启续清、任务隔离
 .venv/bin/python -I tests/test_cancel_race.py  # 9 项：取消/完成条件 UPDATE 仲裁
 
 # 内存压力测试：两份各 196.5 MiB（合计约 393 MiB，超过 256 MiB 内存上限），
@@ -109,10 +133,10 @@ bash scripts/run_tests.sh
 ```
 app/
   config.py    # 上限、路径、批大小等配置（环境变量可覆盖）
-  db.py        # SQLite schema 与任务/记录访问
+  db.py        # SQLite schema（含 release_status 迁移）与任务/记录访问
   fastq.py     # 流式解析、校验、JOIN 配对发布
-  worker.py    # 后台线程、取消仲裁、启动恢复、任务目录清理
-  main.py      # FastAPI 路由与有界流式上传
+  worker.py    # 后台线程、取消仲裁、启动恢复、下载计数与释放清理
+  main.py      # FastAPI 路由、有界流式上传、受跟踪的结果下载
 tests/         # 功能自测与内存压力测试
 scripts/demo.sh
 Dockerfile, docker-compose.yml, requirements.txt
@@ -122,8 +146,9 @@ Dockerfile, docker-compose.yml, requirements.txt
 
 - 仅接受未压缩 FASTQ；`.gz` 等压缩格式不在范围内。
 - 服务为单实例 + 单 SQLite 文件设计；多实例横向扩展需要换用共享存储/队列。
-- 没有内置任务 TTL 清理，成功结果会一直保留在数据卷中，需外部运维定期清理。
+- 成功结果默认一直保留在数据卷中，由调用方通过 `POST /tasks/{id}/release`
+  主动回收磁盘；没有内置 TTL 自动释放。
 - 开发沙箱内未安装 Docker，`docker compose up` 未实跑；compose/Dockerfile 仅做
   了 YAML 与结构校验，应用本身已用等价的本地 uvicorn 命令完整验证（含
-  `/docs`、上传、取消、下载、重启恢复）。在装有 Docker 的环境执行
+  `/docs`、上传、取消、释放、下载、重启恢复）。在装有 Docker 的环境执行
   `docker compose up --build` 即可，`mem_limit: 256m` 即内存上限。

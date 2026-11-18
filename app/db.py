@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     r2_bytes        INTEGER NOT NULL DEFAULT 0,
     result_r1       TEXT NOT NULL DEFAULT '',
     result_r2       TEXT NOT NULL DEFAULT '',
+    release_status  TEXT NOT NULL DEFAULT 'none',
+    release_error   TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -47,6 +49,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_records_lookup
 """
 
 _TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
+
+# Release lifecycle for succeeded tasks: none -> releasing -> released.
+RELEASE_NONE = "none"
+RELEASE_RELEASING = "releasing"
+RELEASE_RELEASED = "released"
 
 _init_lock = threading.Lock()
 _initialized = False
@@ -85,9 +92,23 @@ def init_db() -> None:
         conn = connect()
         try:
             conn.executescript(SCHEMA)
+            _migrate(conn)
         finally:
             conn.close()
         _initialized = True
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add release columns to databases created before they existed."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "release_status" not in cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN release_status TEXT NOT NULL DEFAULT 'none'"
+        )
+    if "release_error" not in cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN release_error TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def create_task(
@@ -138,6 +159,8 @@ def update_task(
     message: Optional[str] = None,
     result_r1: Optional[str] = None,
     result_r2: Optional[str] = None,
+    release_status: Optional[str] = None,
+    release_error: Optional[str] = None,
 ) -> None:
     fields = ["updated_at = ?"]
     values: list = [utcnow()]
@@ -159,6 +182,12 @@ def update_task(
     if result_r2 is not None:
         fields.append("result_r2 = ?")
         values.append(result_r2)
+    if release_status is not None:
+        fields.append("release_status = ?")
+        values.append(release_status)
+    if release_error is not None:
+        fields.append("release_error = ?")
+        values.append(release_error)
     values.append(task_id)
     conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", values)
 
@@ -209,5 +238,46 @@ def non_terminal_task_ids(conn: sqlite3.Connection) -> list[str]:
         row["id"]
         for row in conn.execute(
             "SELECT id FROM tasks WHERE status NOT IN ('succeeded','failed','cancelled')"
+        )
+    ]
+
+
+def try_start_release(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Move a succeeded task's release status to 'releasing'.
+
+    Returns the release status in effect after the call ('releasing' or
+    'released'), or ``None`` when the task does not exist or is not in a
+    succeeded state. The UPDATE is conditional and idempotent: repeating it
+    while 'releasing' is a no-op that simply re-confirms the state, and a
+    task that already reached 'released' is never moved back.
+    """
+    row = get_task(conn, task_id)
+    if row is None or row["status"] != "succeeded":
+        return None
+    if row["release_status"] == RELEASE_RELEASED:
+        return RELEASE_RELEASED
+    conn.execute(
+        "UPDATE tasks SET release_status = ?, updated_at = ? "
+        "WHERE id = ? AND release_status IN (?, ?)",
+        (RELEASE_RELEASING, utcnow(), task_id, RELEASE_NONE, RELEASE_RELEASING),
+    )
+    return RELEASE_RELEASING
+
+
+def mark_released(conn: sqlite3.Connection, task_id: str) -> None:
+    """Record successful cleanup; conditional so it cannot resurrect a row
+    whose release state changed concurrently."""
+    conn.execute(
+        "UPDATE tasks SET release_status = ?, release_error = '', updated_at = ? "
+        "WHERE id = ? AND release_status = ?",
+        (RELEASE_RELEASED, utcnow(), task_id, RELEASE_RELEASING),
+    )
+
+
+def releasing_task_ids(conn: sqlite3.Connection) -> list[str]:
+    return [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE release_status = ?", (RELEASE_RELEASING,)
         )
     ]
